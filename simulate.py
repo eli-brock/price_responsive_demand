@@ -1,5 +1,6 @@
 import numpy as np
 import cvxpy as cp
+from scipy.special import factorial
 
 def sim(
     L: list,
@@ -16,7 +17,8 @@ def sim(
     p_line_max: np.array,
     cost_lin: np.array,
     cost_quad: np.array,
-    generator_ratio: np.array
+    generator_ratio: np.array,
+    voll: np.array
 ) -> cp.Problem:
     '''
     Arguments:
@@ -57,9 +59,6 @@ def sim(
     AL = np.zeros((N,len(L)))
     AL[L,:] = np.eye(len(L))
 
-    # The coefficient of the demand-side objective function
-    K = price/demand**(1/epsilon)
-
     # CVXPY variables
     p_d = cp.Variable((len(L), T), name='p_d')
     p_g_int = cp.Variable((len(G), T), name='p_g_int')
@@ -87,14 +86,20 @@ def sim(
         cp.multiply(B, delta_t[:,np.newaxis]-delta_t[np.newaxis,:]) <= p_line_max
         for delta_t in delta.T
     ]
-    
+
+    # The maximum consumption at the value of lost load
+    p_voll = (voll/price)**epsilon*demand
+
     # Co-optimize over the supply- and demand-side cost functions. We use cost convention, so this is a minimization problem.
     opf = cp.Problem(
         cp.Minimize(
             cp.sum(
                 cost_lin@p_g_dis+cost_quad@cp.square(p_g_dis)
             ) - cp.sum(
-                cp.multiply(K*epsilon/(1+epsilon), cp.exp(cp.multiply((1/epsilon+1),cp.log(p_d))))
+                voll*p_voll + cp.multiply(
+                    price/demand**(1/epsilon)*epsilon/(1+epsilon),
+                    cp.exp(cp.multiply((1/epsilon+1),cp.log(p_d))) - p_voll**(1/epsilon+1)
+                )
             )
         ),
         constraints
