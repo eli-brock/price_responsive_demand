@@ -19,7 +19,7 @@ class Network:
             p_line_max,
             cost_lin,
             cost_quad,
-            generator_ratio,
+            int_gen_ratio,
             voll
         ):
         self.loads = loads
@@ -36,7 +36,7 @@ class Network:
         self.p_line_max = p_line_max
         self.cost_lin = cost_lin
         self.cost_quad = cost_quad
-        self.generator_ratio = generator_ratio
+        self.int_gen_ratio = int_gen_ratio
         self.voll = voll
 
         self.n = int(np.unique(B.shape).squeeze())
@@ -66,10 +66,10 @@ class Network:
 
         constraints = [
             TG@(p_g_dis+p_g_int)-TL@(p_d)-p_b == -self.B@angle,
-            p_g_int <= self.p_g_int_max*self.generator_ratio,
+            p_g_int <= self.p_g_int_max*self.int_gen_ratio,
             p_g_int >= 0,
-            p_g_dis <= self.p_g_dis_max[:,np.newaxis]*(1-self.generator_ratio),
-            p_g_dis >= self.p_g_dis_min[:,np.newaxis]*(1-self.generator_ratio),
+            p_g_dis <= self.p_g_dis_max[:,np.newaxis]*(1-self.int_gen_ratio),
+            p_g_dis >= self.p_g_dis_min[:,np.newaxis]*(1-self.int_gen_ratio),
             cp.cumsum(p_b, axis=1) >= -b_0[:,np.newaxis],
             cp.cumsum(p_b, axis=1) <= (b-b_0)[:,np.newaxis],
             p_b <= b[:,np.newaxis]/self.b_duration,
