@@ -5,91 +5,73 @@ class Network:
     '''A power network for a specified timespan'''
     def __init__(
             self,
-            loads,
-            generators,
             B,
-            p_g_int_max,
-            p_g_dis_min,
-            p_g_dis_max,
-            epsilon,
-            price,
-            demand,
-            b_total,
-            b_duration,
-            p_line_max,
-            cost_lin,
-            cost_quad,
-            int_gen_ratio,
-            voll
+            line_lims,
+            profile,
+            dis_max,
+            total_storage,
+            storage_cycle_hours,
+            cost_coeffs
         ):
-        self.loads = loads
-        self.generators = generators
         self.B = B
-        self.p_g_int_max = p_g_int_max
-        self.p_g_dis_min = p_g_dis_min
-        self.p_g_dis_max = p_g_dis_max
-        self.epsilon = epsilon
-        self.price = price
-        self.demand = demand
-        self.b_total = b_total
-        self.b_duration = b_duration
-        self.p_line_max = p_line_max
-        self.cost_lin = cost_lin
-        self.cost_quad = cost_quad
-        self.int_gen_ratio = int_gen_ratio
-        self.voll = voll
-
-        self.n = int(np.unique(B.shape).squeeze())
-        self.t = int(epsilon.shape[1])
-        self.n_g = self.generators.size
-        self.n_l = self.loads.size
-
-        self.delta = self.demand*self.voll**self.epsilon/(self.price**self.epsilon-self.voll**self.epsilon)
-
-        self.opf = None
+        self.line_lims = line_lims
+        self.profile = profile
+        self.dis_max = dis_max
+        self.total_storage = total_storage
+        self.storage_cycle_hours = storage_cycle_hours
+        self.cost_coeffs = cost_coeffs
 
     def solve(self):
         '''Optimize the dipatch of generators, loads, and storage.'''
-        TG = np.zeros((self.n,self.n_g))
-        TG[self.generators,:] = np.eye(self.n_g)
-        TL = np.zeros((self.n,self.n_l))
-        TL[self.loads,:] = np.eye(self.n_l)
+
+        # Define helpful variables
+        generators = self.profile.nom_load.columns
+        loads = self.profile.int_gen.columns
+        n = self.B.shape[0]
+        n_g = len(generators)
+        n_l = len(loads)
+        t = len(self.profile.index)
+        TG = np.zeros((n,n_g))
+        TG[generators-1,:] = np.eye(n_g)
+        TL = np.zeros((n,n_l))
+        TL[loads-1,:] = np.eye(n_l)
 
         # CVXPY variables
-        p_d = cp.Variable((self.n_l, self.t), name='p_d')
-        p_g_int = cp.Variable((self.n_g, self.t), name='p_g_int')
-        p_g_dis = cp.Variable((self.n_g,self.t), name='p_g_dis')
-        p_b = cp.Variable((self.n,self.t), name='p_b')
-        b = cp.Variable(self.n, name='b')
-        b_0 = cp.Variable(self.n, name='b_0')
+        load = cp.Variable((n_l, self.t), name='load')
+        generation = cp.Variable((self.n_g, self.t), name='generation')
+        storage_load = cp.Variable((self.n,self.t), name='storage_load')
+        storage_capacity = cp.Variable(self.n, name='storage_capacity')
+        initial_soc = cp.Variable(self.n, name='initial_soc')
         angle = cp.Variable((self.n, self.t), name='angle')
 
         constraints = [
-            TG@(p_g_dis+p_g_int)-TL@(p_d)-p_b == -self.B@angle,
-            p_g_int <= self.p_g_int_max*self.int_gen_ratio,
-            p_g_int >= 0,
-            p_g_dis <= self.p_g_dis_max[:,np.newaxis]*(1-self.int_gen_ratio),
-            p_g_dis >= self.p_g_dis_min[:,np.newaxis]*(1-self.int_gen_ratio),
-            cp.cumsum(p_b, axis=1) >= -b_0[:,np.newaxis],
-            cp.cumsum(p_b, axis=1) <= (b-b_0)[:,np.newaxis],
-            p_b <= b[:,np.newaxis]/self.b_duration,
-            p_b >= -b[:,np.newaxis]/self.b_duration,
-            cp.sum(b) == self.b_total,
-            b_0 >= 0,
-            b_0 <= b,
+            TG@generation-TL@load-storage_load == -self.B@angle,
+            generation <= self.dis_max + self.profile.int_gen,
+            generation >= 0,
+            cp.cumsum(storage_load, axis=1) >= -storage_capacity[:,np.newaxis],
+            cp.cumsum(storage_load, axis=1) <= (storage_capacity-initial_soc)[:,np.newaxis],
+            storage_load <= storage[:,np.newaxis]/self.storage_cycle_timesteps,
+            storage_load >= -storage[:,np.newaxis]/self.storage_cycle_timesteps,
+            cp.sum(storage_capacity) == self.total_storage,
+            initial_soc >= 0,
+            initial_soc <= storage_capacity,
         ] + [
-            cp.multiply(self.B, angle_t[:,np.newaxis]-angle_t[np.newaxis,:]) <= self.p_line_max
+            cp.multiply(self.B, angle_t[:,np.newaxis]-angle_t[np.newaxis,:]) <= self.line_lims
             for angle_t in angle.T
         ]
 
+        dis_cost = lambda p: p@cp.diag(self.cost[0,:]) + cp.square(p)@cp.diag(self.cost[1,:])
+        cost = lambda p: cp.maximum(0,dis_cost(p-self.profile.int_gen))
+        utility = (
+            lambda p: self.profile.nom_price*self.profile.elasticity
+            *cp.exp(cp.multiply(1 + 1/self.profile.elasticity, cp.log(p+delta)))
+            /(self.profile.nom_load + delta)**(1/self.profile.elasticity)
+            /(self.profile.elasticity + 1)
+        )
+
         self.opf = cp.Problem(
             cp.Minimize(
-                cp.sum(
-                    self.cost_lin@p_g_dis+self.cost_quad@cp.square(p_g_dis)
-                ) - cp.sum(
-                    cp.multiply(self.epsilon*self.price,cp.exp(cp.multiply(1/self.epsilon+1,cp.log(p_d+self.delta)))-self.delta**(1/self.epsilon+1))
-                    /(self.epsilon+1)/(self.demand+self.delta)**(1/self.epsilon)
-                )
+                cp.sum(cost(generation)-utility(load))
             ),
             constraints
         )
