@@ -1,5 +1,6 @@
 import numpy as np
 import cvxpy as cp
+import pandas as pd
 
 class Network:
     '''A power network for a specified timespan'''
@@ -10,7 +11,7 @@ class Network:
             profile,
             dis_max,
             total_storage,
-            storage_cycle_hours,
+            storage_cycle_timesteps,
             cost_coeffs
         ):
         self.B = B
@@ -18,15 +19,15 @@ class Network:
         self.profile = profile
         self.dis_max = dis_max
         self.total_storage = total_storage
-        self.storage_cycle_hours = storage_cycle_hours
+        self.storage_cycle_timesteps = storage_cycle_timesteps
         self.cost_coeffs = cost_coeffs
 
     def solve(self):
         '''Optimize the dipatch of generators, loads, and storage.'''
 
-        # Define helpful variables
-        generators = self.profile.nom_load.columns
-        loads = self.profile.int_gen.columns
+        # Helpful variables
+        generators = np.array(self.profile.int_gen.columns)
+        loads = np.array(self.profile.nom_load.columns)
         n = self.B.shape[0]
         n_g = len(generators)
         n_l = len(loads)
@@ -37,44 +38,79 @@ class Network:
         TL[loads-1,:] = np.eye(n_l)
 
         # CVXPY variables
-        load = cp.Variable((n_l, self.t), name='load')
-        generation = cp.Variable((self.n_g, self.t), name='generation')
-        storage_load = cp.Variable((self.n,self.t), name='storage_load')
-        storage_capacity = cp.Variable(self.n, name='storage_capacity')
-        initial_soc = cp.Variable(self.n, name='initial_soc')
-        angle = cp.Variable((self.n, self.t), name='angle')
+        load = cp.Variable((t,n_l), name='load')
+        generation = cp.Variable((t,n_g), name='generation')
+        storage_load = cp.Variable((t,n), name='storage_load')
+        storage_capacity = cp.Variable(n, name='storage_capacity')
+        initial_soc = cp.Variable(n, name='initial_soc')
+        angle = cp.Variable((t,n), name='angle')
 
+        # Define constraints
         constraints = [
-            TG@generation-TL@load-storage_load == -self.B@angle,
+            TG@generation.T-TL@load.T-storage_load.T == -self.B@angle.T,
             generation <= self.dis_max + self.profile.int_gen,
             generation >= 0,
-            cp.cumsum(storage_load, axis=1) >= -storage_capacity[:,np.newaxis],
-            cp.cumsum(storage_load, axis=1) <= (storage_capacity-initial_soc)[:,np.newaxis],
-            storage_load <= storage[:,np.newaxis]/self.storage_cycle_timesteps,
-            storage_load >= -storage[:,np.newaxis]/self.storage_cycle_timesteps,
+            cp.cumsum(storage_load, axis=0) >= -initial_soc[np.newaxis,:],
+            cp.cumsum(storage_load, axis=0) <= (storage_capacity-initial_soc)[np.newaxis,:],
+            storage_load <= storage_capacity[np.newaxis,:]/self.storage_cycle_timesteps,
+            storage_load >= -storage_capacity[np.newaxis,:]/self.storage_cycle_timesteps,
             cp.sum(storage_capacity) == self.total_storage,
             initial_soc >= 0,
             initial_soc <= storage_capacity,
         ] + [
             cp.multiply(self.B, angle_t[:,np.newaxis]-angle_t[np.newaxis,:]) <= self.line_lims
-            for angle_t in angle.T
+            for angle_t in angle
         ]
 
-        dis_cost = lambda p: p@cp.diag(self.cost[0,:]) + cp.square(p)@cp.diag(self.cost[1,:])
-        cost = lambda p: cp.maximum(0,dis_cost(p-self.profile.int_gen))
+        # Horizontal shift of elasticity curve
+        delta = (
+            self.profile.nom_load*self.profile.voll**self.profile.elasticity
+            /(
+                self.profile.nom_price**self.profile.elasticity
+                - self.profile.voll**self.profile.elasticity
+            )
+        )
+
+        # Cost as a function of the dispatchable generation
+        dis_cost = lambda p: (
+            p@cp.diag(self.cost_coeffs[0,:])
+            + cp.square(p)@cp.diag(self.cost_coeffs[1,:])
+        )
+
+        # Cost as a function of total generation
+        cost = lambda p: cp.maximum(0, dis_cost(p-self.profile.int_gen))
+
+        # Utility function
         utility = (
-            lambda p: self.profile.nom_price*self.profile.elasticity
-            *cp.exp(cp.multiply(1 + 1/self.profile.elasticity, cp.log(p+delta)))
-            /(self.profile.nom_load + delta)**(1/self.profile.elasticity)
-            /(self.profile.elasticity + 1)
+            lambda p: cp.multiply(
+                self.profile.nom_price*self.profile.elasticity
+                /(self.profile.nom_load + delta)**(1/self.profile.elasticity)
+                /(self.profile.elasticity + 1),
+                cp.exp(cp.multiply(1 + 1/self.profile.elasticity, cp.log(p+delta)))
+                - delta**(1+1/self.profile.elasticity)
+            )
         )
 
         self.opf = cp.Problem(
             cp.Minimize(
-                cp.sum(cost(generation)-utility(load))
+                cp.sum(cost(generation))-cp.sum(utility(load))
             ),
             constraints
         )
 
-        self.opf.solve()
+        self.opf.solve(verbose=True)
+
+        output = pd.concat(
+            {
+                'load': pd.DataFrame(load.value,columns=loads),
+                'generation': pd.DataFrame(generation.value,columns=generators),
+                'storage_load': pd.DataFrame(storage_load.value,columns=range(1,n+1)),
+                'angle': pd.DataFrame(angle.value,columns=range(1,n+1)),
+                'price': pd.DataFrame(-self.opf.constraints[0].dual_value.T,columns=range(1,n+1))
+            },
+            axis='columns'
+        )
+        output.index = self.profile.index
+
+        self.profile = pd.concat((self.profile,output),axis='columns')
         
