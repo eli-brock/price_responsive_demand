@@ -22,6 +22,42 @@ class Network:
         self.storage_cycle_timesteps = storage_cycle_timesteps
         self.cost_coeffs = cost_coeffs
 
+    def dis_cost(self,p):
+        return (
+            p@np.diag(self.cost_coeffs[0,:])
+            + cp.square(p)@np.diag(self.cost_coeffs[1,:])
+        )
+    
+    def cost(self,p):
+        return cp.maximum(0, self.dis_cost(p-self.profile.int_gen))
+    
+    def utility(self,p):
+        delta = (
+            self.profile.nom_load*self.profile.voll**self.profile.elasticity
+            /(
+                self.profile.nom_price**self.profile.elasticity
+                - self.profile.voll**self.profile.elasticity
+            )
+        )
+
+        return cp.bmat(
+            [
+                [
+                    self.profile.nom_price.iloc[i,j]
+                    *self.profile.elasticity.iloc[i,j]
+                    /(self.profile.nom_load.iloc[i,j]+delta.iloc[i,j])**(1/self.profile.elasticity.iloc[i,j])
+                    /(self.profile.elasticity.iloc[i,j] + 1)
+                    *(
+                        (p[i,j]+delta.iloc[i,j])**(1+1/self.profile.elasticity.iloc[i,j])
+                        - delta.iloc[i,j]**(1+1/self.profile.elasticity.iloc[i,j])
+                    )
+                    for j in range(p.shape[1])
+                ]
+                for i in range(p.shape[0])
+            ]
+        )
+
+
     def solve(self):
         '''Optimize the dipatch of generators, loads, and storage.'''
 
@@ -62,55 +98,16 @@ class Network:
             for angle_t in angle
         ]
 
-        # Horizontal shift of elasticity curve
-        delta = (
-            self.profile.nom_load*self.profile.voll**self.profile.elasticity
-            /(
-                self.profile.nom_price**self.profile.elasticity
-                - self.profile.voll**self.profile.elasticity
-            )
-        )
-        self.delta = delta
-
-        # Cost as a function of the dispatchable generation
-        dis_cost = lambda p: (
-            p@np.diag(self.cost_coeffs[0,:])
-            + cp.square(p)@np.diag(self.cost_coeffs[1,:])
-        )
-
-        # Cost as a function of total generation
-        cost = lambda p: cp.maximum(0, dis_cost(p-self.profile.int_gen))
-        
-        # Utility function
-        utility = (
-            lambda p: cp.bmat(
-                [
-                    [
-                        self.profile.nom_price.iloc[i,j]
-                        *self.profile.elasticity.iloc[i,j]
-                        /(self.profile.nom_load.iloc[i,j]+delta.iloc[i,j])**(1/self.profile.elasticity.iloc[i,j])
-                        /(self.profile.elasticity.iloc[i,j] + 1)
-                        *(
-                            (p[i,j]+delta.iloc[i,j])**(1+1/self.profile.elasticity.iloc[i,j])
-                            - delta.iloc[i,j]**(1+1/self.profile.elasticity.iloc[i,j])
-                        )
-                        for j in range(p.shape[1])
-                    ]
-                    for i in range(p.shape[0])
-                ]
-            )
-        )
-
-        self.opf = cp.Problem(
+        opf = cp.Problem(
             cp.Minimize(
-                (cp.sum(cost(generation))-cp.sum(utility(load)))
+                (cp.sum(self.cost(generation))-cp.sum(self.utility(load)))
             ),
             constraints
         )
 
-        self.opf.solve(verbose=True)
+        opf.solve(verbose=True)
 
-        price = -self.opf.constraints[0].dual_value.T
+        price = -opf.constraints[0].dual_value.T
         output = pd.concat(
             {
                 'load': pd.DataFrame(load.value,columns=loads),
@@ -118,8 +115,8 @@ class Network:
                 'storage_load': pd.DataFrame(storage_load.value,columns=range(1,n+1)),
                 'angle': pd.DataFrame(angle.value,columns=range(1,n+1)),
                 'price': pd.DataFrame(price,columns=range(1,n+1)),
-                'consumer_surplus': pd.DataFrame(utility(load.value).value-price[:,loads-1]*load.value,columns=loads),
-                'producer_surplus': pd.DataFrame(price[:,generators-1]*generation.value-cost(generation).value,columns=generators)
+                'consumer_surplus': pd.DataFrame(self.utility(load.value).value-price[:,loads-1]*load.value,columns=loads),
+                'producer_surplus': pd.DataFrame(price[:,generators-1]*generation.value-self.cost(generation).value,columns=generators)
             },
             axis='columns'
         )
