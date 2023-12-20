@@ -70,43 +70,56 @@ class Network:
                 - self.profile.voll**self.profile.elasticity
             )
         )
+        self.delta = delta
 
         # Cost as a function of the dispatchable generation
         dis_cost = lambda p: (
-            p@cp.diag(self.cost_coeffs[0,:])
-            + cp.square(p)@cp.diag(self.cost_coeffs[1,:])
+            p@np.diag(self.cost_coeffs[0,:])
+            + cp.square(p)@np.diag(self.cost_coeffs[1,:])
         )
 
         # Cost as a function of total generation
         cost = lambda p: cp.maximum(0, dis_cost(p-self.profile.int_gen))
-
+        
         # Utility function
         utility = (
-            lambda p: cp.multiply(
-                self.profile.nom_price*self.profile.elasticity
-                /(self.profile.nom_load + delta)**(1/self.profile.elasticity)
-                /(self.profile.elasticity + 1),
-                cp.exp(cp.multiply(1 + 1/self.profile.elasticity, cp.log(p+delta)))
-                - delta**(1+1/self.profile.elasticity)
+            lambda p: cp.bmat(
+                [
+                    [
+                        self.profile.nom_price.iloc[i,j]
+                        *self.profile.elasticity.iloc[i,j]
+                        /(self.profile.nom_load.iloc[i,j]+delta.iloc[i,j])**(1/self.profile.elasticity.iloc[i,j])
+                        /(self.profile.elasticity.iloc[i,j] + 1)
+                        *(
+                            (p[i,j]+delta.iloc[i,j])**(1+1/self.profile.elasticity.iloc[i,j])
+                            - delta.iloc[i,j]**(1+1/self.profile.elasticity.iloc[i,j])
+                        )
+                        for j in range(p.shape[1])
+                    ]
+                    for i in range(p.shape[0])
+                ]
             )
         )
 
         self.opf = cp.Problem(
             cp.Minimize(
-                cp.sum(cost(generation))-cp.sum(utility(load))
+                (cp.sum(cost(generation))-cp.sum(utility(load)))
             ),
             constraints
         )
 
         self.opf.solve(verbose=True)
 
+        price = -self.opf.constraints[0].dual_value.T
         output = pd.concat(
             {
                 'load': pd.DataFrame(load.value,columns=loads),
                 'generation': pd.DataFrame(generation.value,columns=generators),
                 'storage_load': pd.DataFrame(storage_load.value,columns=range(1,n+1)),
                 'angle': pd.DataFrame(angle.value,columns=range(1,n+1)),
-                'price': pd.DataFrame(-self.opf.constraints[0].dual_value.T,columns=range(1,n+1))
+                'price': pd.DataFrame(price,columns=range(1,n+1)),
+                'consumer_surplus': pd.DataFrame(utility(load.value).value-price[:,loads-1]*load.value,columns=loads),
+                'producer_surplus': pd.DataFrame(price[:,generators-1]*generation.value-cost(generation).value,columns=generators)
             },
             axis='columns'
         )
