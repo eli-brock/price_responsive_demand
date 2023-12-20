@@ -2,6 +2,11 @@ import numpy as np
 import cvxpy as cp
 import pandas as pd
 
+def outer_difference(x):
+    '''Helper function used to compute line flows'''
+    return x[:,np.newaxis]-x[np.newaxis,:]
+
+
 class Network:
     '''A power network for a specified timespan'''
     def __init__(
@@ -21,42 +26,15 @@ class Network:
         self.total_storage = total_storage
         self.storage_cycle_timesteps = storage_cycle_timesteps
         self.cost_coeffs = cost_coeffs
+        self.storage_capacity = None
+        self.initial_charge = None
 
     def dis_cost(self,p):
+        '''Helper function that gives the generation cost as a function of _dispatchable_ generation `p`'''
         return (
             p@np.diag(self.cost_coeffs[0,:])
             + cp.square(p)@np.diag(self.cost_coeffs[1,:])
         )
-    
-    def cost(self,p):
-        return cp.maximum(0, self.dis_cost(p-self.profile.int_gen))
-    
-    def utility(self,p):
-        delta = (
-            self.profile.nom_load*self.profile.voll**self.profile.elasticity
-            /(
-                self.profile.nom_price**self.profile.elasticity
-                - self.profile.voll**self.profile.elasticity
-            )
-        )
-
-        return cp.bmat(
-            [
-                [
-                    self.profile.nom_price.iloc[i,j]
-                    *self.profile.elasticity.iloc[i,j]
-                    /(self.profile.nom_load.iloc[i,j]+delta.iloc[i,j])**(1/self.profile.elasticity.iloc[i,j])
-                    /(self.profile.elasticity.iloc[i,j] + 1)
-                    *(
-                        (p[i,j]+delta.iloc[i,j])**(1+1/self.profile.elasticity.iloc[i,j])
-                        - delta.iloc[i,j]**(1+1/self.profile.elasticity.iloc[i,j])
-                    )
-                    for j in range(p.shape[1])
-                ]
-                for i in range(p.shape[0])
-            ]
-        )
-
 
     def solve(self):
         '''Optimize the dipatch of generators, loads, and storage.'''
@@ -78,7 +56,7 @@ class Network:
         generation = cp.Variable((t,n_g), name='generation')
         storage_load = cp.Variable((t,n), name='storage_load')
         storage_capacity = cp.Variable(n, name='storage_capacity')
-        initial_soc = cp.Variable(n, name='initial_soc')
+        initial_charge = cp.Variable(n, name='initial_charge')
         angle = cp.Variable((t,n), name='angle')
 
         # Define constraints
@@ -86,28 +64,62 @@ class Network:
             TG@generation.T-TL@load.T-storage_load.T == -self.B@angle.T,
             generation <= self.dis_max + self.profile.int_gen,
             generation >= 0,
-            cp.cumsum(storage_load, axis=0) >= -initial_soc[np.newaxis,:],
-            cp.cumsum(storage_load, axis=0) <= (storage_capacity-initial_soc)[np.newaxis,:],
+            cp.cumsum(storage_load, axis=0) >= -initial_charge[np.newaxis,:],
+            cp.cumsum(storage_load, axis=0) <= (storage_capacity-initial_charge)[np.newaxis,:],
             storage_load <= storage_capacity[np.newaxis,:]/self.storage_cycle_timesteps,
             storage_load >= -storage_capacity[np.newaxis,:]/self.storage_cycle_timesteps,
             cp.sum(storage_capacity) == self.total_storage,
-            initial_soc >= 0,
-            initial_soc <= storage_capacity,
+            initial_charge >= 0,
+            initial_charge <= storage_capacity,
         ] + [
-            cp.multiply(self.B, angle_t[:,np.newaxis]-angle_t[np.newaxis,:]) <= self.line_lims
+            cp.multiply(self.B, outer_difference(angle_t)) <= self.line_lims
             for angle_t in angle
         ]
 
+        # The offset necessary to achieve the value-of-lost-load
+        delta = (
+            self.profile.nom_load*self.profile.voll**self.profile.elasticity
+            /(
+                self.profile.nom_price**self.profile.elasticity
+                - self.profile.voll**self.profile.elasticity
+            )
+        )
+
+        # The utility as a function of the load
+        utility = cp.bmat(
+            [
+                [
+                    self.profile.nom_price.iloc[i,j]
+                    *self.profile.elasticity.iloc[i,j]
+                    /(self.profile.nom_load.iloc[i,j]+delta.iloc[i,j])**(1/self.profile.elasticity.iloc[i,j])
+                    /(self.profile.elasticity.iloc[i,j] + 1)
+                    *(
+                        (load[i,j]+delta.iloc[i,j])**(1+1/self.profile.elasticity.iloc[i,j])
+                        - delta.iloc[i,j]**(1+1/self.profile.elasticity.iloc[i,j])
+                    )
+                    for j in range(load.shape[1])
+                ]
+                for i in range(load.shape[0])
+            ]
+        )
+
+        # The cost as a function of generation
+        cost = cp.maximum(0, self.dis_cost(generation-self.profile.int_gen))
+
         opf = cp.Problem(
             cp.Minimize(
-                (cp.sum(self.cost(generation))-cp.sum(self.utility(load)))
+                cp.sum(cost)-cp.sum(utility)
             ),
             constraints
         )
 
-        opf.solve(verbose=True)
+        # Solve with CVXPY
+        opf.solve()
 
+        # Extract the prices, which are the dual of the power flow constraints
         price = -opf.constraints[0].dual_value.T
+
+        # Construct an output dataframe to be concatenated with the input profile
         output = pd.concat(
             {
                 'load': pd.DataFrame(load.value,columns=loads),
@@ -115,12 +127,15 @@ class Network:
                 'storage_load': pd.DataFrame(storage_load.value,columns=range(1,n+1)),
                 'angle': pd.DataFrame(angle.value,columns=range(1,n+1)),
                 'price': pd.DataFrame(price,columns=range(1,n+1)),
-                'consumer_surplus': pd.DataFrame(self.utility(load.value).value-price[:,loads-1]*load.value,columns=loads),
-                'producer_surplus': pd.DataFrame(price[:,generators-1]*generation.value-self.cost(generation).value,columns=generators)
+                'cost': pd.DataFrame(cost.value,columns=generators),
+                'utility': pd.DataFrame(utility.value,columns=loads)
             },
             axis='columns'
         )
         output.index = self.profile.index
 
+        # Update the object with simulation outputs
         self.profile = pd.concat((self.profile,output),axis='columns')
+        self.storage_capacity = storage_capacity.value
+        self.initial_charge = initial_charge.value
         
