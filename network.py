@@ -17,7 +17,8 @@ class Network:
             dis_max,
             total_storage,
             storage_cycle_timesteps,
-            cost_coeffs
+            cost_coeffs,
+            cycle_storage
         ):
         self.B = B
         self.line_lims = line_lims
@@ -28,6 +29,7 @@ class Network:
         self.cost_coeffs = cost_coeffs
         self.storage_capacity = None
         self.initial_charge = None
+        self.cycle_storage = cycle_storage
 
     def dis_cost(self,p):
         '''Helper function that gives the generation cost as a function of _dispatchable_ generation `p`'''
@@ -52,12 +54,12 @@ class Network:
         TL[loads-1,:] = np.eye(n_l)
 
         # CVXPY variables
-        load = cp.Variable((t,n_l), name='load')
-        generation = cp.Variable((t,n_g), name='generation')
-        storage_load = cp.Variable((t,n), name='storage_load')
-        storage_capacity = cp.Variable(n, name='storage_capacity')
-        initial_charge = cp.Variable(n, name='initial_charge')
-        angle = cp.Variable((t,n), name='angle')
+        load = cp.Variable((t,n_l))
+        generation = cp.Variable((t,n_g))
+        storage_load = cp.Variable((t,n))
+        storage_capacity = cp.Variable(n)
+        initial_charge = cp.Variable(n)
+        angle = cp.Variable((t,n))
 
         # Define constraints
         constraints = [
@@ -75,6 +77,10 @@ class Network:
             cp.multiply(self.B, outer_difference(angle_t)) <= self.line_lims
             for angle_t in angle
         ]
+        constraints = (
+            constraints + [cp.sum(storage_load,axis=0) == 0] if self.cycle_storage
+            else constraints
+        )
 
         # The offset necessary to achieve the value-of-lost-load
         delta = (
@@ -108,7 +114,7 @@ class Network:
 
         opf = cp.Problem(
             cp.Minimize(
-                cp.sum(cost)-cp.sum(utility)
+                (cp.sum(cost)-cp.sum(utility))
             ),
             constraints
         )
