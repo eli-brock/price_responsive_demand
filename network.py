@@ -141,6 +141,11 @@ class Network:
         output.index = self.profile.index
 
         # Update the object with simulation outputs
+        self.profile = (
+            self.profile.drop(columns=output.columns)
+            if output.columns.isin(self.profile.columns).all()
+            else self.profile
+        )
         self.profile = pd.concat((self.profile,output),axis='columns')
         self.storage_capacity = storage_capacity.value
         self.initial_charge = initial_charge.value
