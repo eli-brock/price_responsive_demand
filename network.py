@@ -1,98 +1,152 @@
 import numpy as np
 import cvxpy as cp
+import pandas as pd
+
+def outer_difference(x):
+    '''Helper function used to compute line flows'''
+    return x[:,np.newaxis]-x[np.newaxis,:]
+
 
 class Network:
     '''A power network for a specified timespan'''
     def __init__(
             self,
-            loads,
-            generators,
             B,
-            p_g_int_max,
-            p_g_dis_min,
-            p_g_dis_max,
-            epsilon,
-            price,
-            demand,
-            b_total,
-            b_duration,
-            p_line_max,
-            cost_lin,
-            cost_quad,
-            int_gen_ratio,
-            voll
+            line_lims,
+            profile,
+            dis_max,
+            total_storage,
+            storage_cycle_timesteps,
+            cost_coeffs,
+            cycle_storage
         ):
-        self.loads = loads
-        self.generators = generators
         self.B = B
-        self.p_g_int_max = p_g_int_max
-        self.p_g_dis_min = p_g_dis_min
-        self.p_g_dis_max = p_g_dis_max
-        self.epsilon = epsilon
-        self.price = price
-        self.demand = demand
-        self.b_total = b_total
-        self.b_duration = b_duration
-        self.p_line_max = p_line_max
-        self.cost_lin = cost_lin
-        self.cost_quad = cost_quad
-        self.int_gen_ratio = int_gen_ratio
-        self.voll = voll
+        self.line_lims = line_lims
+        self.profile = profile
+        self.dis_max = dis_max
+        self.total_storage = total_storage
+        self.storage_cycle_timesteps = storage_cycle_timesteps
+        self.cost_coeffs = cost_coeffs
+        self.storage_capacity = None
+        self.initial_charge = None
+        self.cycle_storage = cycle_storage
 
-        self.n = int(np.unique(B.shape).squeeze())
-        self.t = int(epsilon.shape[1])
-        self.n_g = self.generators.size
-        self.n_l = self.loads.size
-
-        self.delta = self.demand*self.voll**self.epsilon/(self.price**self.epsilon-self.voll**self.epsilon)
-
-        self.opf = None
+    def dis_cost(self,p):
+        '''Helper function that gives the generation cost as a function of _dispatchable_ generation `p`'''
+        return (
+            p@np.diag(self.cost_coeffs[0,:])
+            + cp.square(p)@np.diag(self.cost_coeffs[1,:])
+        )
 
     def solve(self):
         '''Optimize the dipatch of generators, loads, and storage.'''
-        TG = np.zeros((self.n,self.n_g))
-        TG[self.generators,:] = np.eye(self.n_g)
-        TL = np.zeros((self.n,self.n_l))
-        TL[self.loads,:] = np.eye(self.n_l)
+
+        # Helpful variables
+        generators = np.array(self.profile.int_gen.columns)
+        loads = np.array(self.profile.nom_load.columns)
+        n = self.B.shape[0]
+        n_g = len(generators)
+        n_l = len(loads)
+        t = len(self.profile.index)
+        TG = np.zeros((n,n_g))
+        TG[generators-1,:] = np.eye(n_g)
+        TL = np.zeros((n,n_l))
+        TL[loads-1,:] = np.eye(n_l)
 
         # CVXPY variables
-        p_d = cp.Variable((self.n_l, self.t), name='p_d')
-        p_g_int = cp.Variable((self.n_g, self.t), name='p_g_int')
-        p_g_dis = cp.Variable((self.n_g,self.t), name='p_g_dis')
-        p_b = cp.Variable((self.n,self.t), name='p_b')
-        b = cp.Variable(self.n, name='b')
-        b_0 = cp.Variable(self.n, name='b_0')
-        angle = cp.Variable((self.n, self.t), name='angle')
+        load = cp.Variable((t,n_l))
+        generation = cp.Variable((t,n_g))
+        storage_load = cp.Variable((t,n))
+        storage_capacity = cp.Variable(n)
+        initial_charge = cp.Variable(n)
+        angle = cp.Variable((t,n))
 
+        # Define constraints
         constraints = [
-            TG@(p_g_dis+p_g_int)-TL@(p_d)-p_b == -self.B@angle,
-            p_g_int <= self.p_g_int_max*self.int_gen_ratio,
-            p_g_int >= 0,
-            p_g_dis <= self.p_g_dis_max[:,np.newaxis]*(1-self.int_gen_ratio),
-            p_g_dis >= self.p_g_dis_min[:,np.newaxis]*(1-self.int_gen_ratio),
-            cp.cumsum(p_b, axis=1) >= -b_0[:,np.newaxis],
-            cp.cumsum(p_b, axis=1) <= (b-b_0)[:,np.newaxis],
-            p_b <= b[:,np.newaxis]/self.b_duration,
-            p_b >= -b[:,np.newaxis]/self.b_duration,
-            cp.sum(b) == self.b_total,
-            b_0 >= 0,
-            b_0 <= b,
+            TG@generation.T-TL@load.T-storage_load.T == -self.B@angle.T,
+            generation <= self.dis_max + self.profile.int_gen,
+            generation >= 0,
+            cp.cumsum(storage_load, axis=0) >= -initial_charge[np.newaxis,:],
+            cp.cumsum(storage_load, axis=0) <= (storage_capacity-initial_charge)[np.newaxis,:],
+            storage_load <= storage_capacity[np.newaxis,:]/self.storage_cycle_timesteps,
+            storage_load >= -storage_capacity[np.newaxis,:]/self.storage_cycle_timesteps,
+            cp.sum(storage_capacity) == self.total_storage,
+            initial_charge >= 0,
+            initial_charge <= storage_capacity,
         ] + [
-            cp.multiply(self.B, angle_t[:,np.newaxis]-angle_t[np.newaxis,:]) <= self.p_line_max
-            for angle_t in angle.T
+            cp.multiply(self.B, outer_difference(angle_t)) <= self.line_lims
+            for angle_t in angle
         ]
+        constraints = (
+            constraints + [cp.sum(storage_load,axis=0) == 0] if self.cycle_storage
+            else constraints
+        )
 
-        self.opf = cp.Problem(
+        # The offset necessary to achieve the value-of-lost-load
+        delta = (
+            self.profile.nom_load*self.profile.voll**self.profile.elasticity
+            /(
+                self.profile.nom_price**self.profile.elasticity
+                - self.profile.voll**self.profile.elasticity
+            )
+        )
+
+        # The utility as a function of the load
+        utility = cp.bmat(
+            [
+                [
+                    self.profile.nom_price.iloc[i,j]
+                    *self.profile.elasticity.iloc[i,j]
+                    /(self.profile.nom_load.iloc[i,j]+delta.iloc[i,j])**(1/self.profile.elasticity.iloc[i,j])
+                    /(self.profile.elasticity.iloc[i,j] + 1)
+                    *(
+                        (load[i,j]+delta.iloc[i,j])**(1+1/self.profile.elasticity.iloc[i,j])
+                        - delta.iloc[i,j]**(1+1/self.profile.elasticity.iloc[i,j])
+                    )
+                    for j in range(load.shape[1])
+                ]
+                for i in range(load.shape[0])
+            ]
+        )
+
+        # The cost as a function of generation
+        cost = cp.maximum(0, self.dis_cost(generation-self.profile.int_gen))
+
+        opf = cp.Problem(
             cp.Minimize(
-                cp.sum(
-                    self.cost_lin@p_g_dis+self.cost_quad@cp.square(p_g_dis)
-                ) - cp.sum(
-                    cp.multiply(self.epsilon*self.price,cp.exp(cp.multiply(1/self.epsilon+1,cp.log(p_d+self.delta)))-self.delta**(1/self.epsilon+1))
-                    /(self.epsilon+1)/(self.demand+self.delta)**(1/self.epsilon)
-                )
+                (cp.sum(cost)-cp.sum(utility))
             ),
             constraints
         )
 
-        self.opf.solve()
+        # Solve with CVXPY
+        opf.solve()
+
+        # Extract the prices, which are the dual of the power flow constraints
+        price = -opf.constraints[0].dual_value.T
+
+        # Construct an output dataframe to be concatenated with the input profile
+        output = pd.concat(
+            {
+                'load': pd.DataFrame(load.value,columns=loads),
+                'generation': pd.DataFrame(generation.value,columns=generators),
+                'storage_load': pd.DataFrame(storage_load.value,columns=range(1,n+1)),
+                'angle': pd.DataFrame(angle.value,columns=range(1,n+1)),
+                'price': pd.DataFrame(price,columns=range(1,n+1)),
+                'cost': pd.DataFrame(cost.value,columns=generators),
+                'utility': pd.DataFrame(utility.value,columns=loads)
+            },
+            axis='columns'
+        )
+        output.index = self.profile.index
+
+        # Update the object with simulation outputs
+        self.profile = (
+            self.profile.drop(columns=output.columns)
+            if output.columns.isin(self.profile.columns).all()
+            else self.profile
+        )
+        self.profile = pd.concat((self.profile,output),axis='columns')
+        self.storage_capacity = storage_capacity.value
+        self.initial_charge = initial_charge.value
         
