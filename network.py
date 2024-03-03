@@ -20,22 +20,62 @@ class Network:
             cost_coeffs,
             cycle_storage
         ):
-        self.B = B
-        self.line_lims = line_lims
-        self.profile = profile
-        self.dis_max = dis_max
+        self.B = B.copy()
+        self.line_lims = line_lims.copy()
+        self.profile = profile.copy()
+        self.dis_max = dis_max.copy()
         self.total_storage = total_storage
         self.storage_cycle_timesteps = storage_cycle_timesteps
-        self.cost_coeffs = cost_coeffs
+        self.cost_coeffs = cost_coeffs.copy()
         self.storage_capacity = None
         self.initial_charge = None
         self.cycle_storage = cycle_storage
+        self.delta = (
+            self.profile.nom_load*self.profile.voll**self.profile.elasticity
+            /(
+                self.profile.nom_price**self.profile.elasticity
+                - self.profile.voll**self.profile.elasticity
+            )
+        )
+
+    def quantity_demanded(self, pi): 
+        return (
+            (pi/self.profile.nom_price)**self.profile.elasticity*(self.profile.nom_load + self.delta) 
+            - self.delta
+        )
+    
+    def quantity_supplied(self, pi):
+        return (
+            self.profile.int_gen 
+            + np.minimum(
+                np.maximum(0,pi - self.cost_coeffs[0,:])/2/self.cost_coeffs[1,:],
+                self.dis_max
+            )
+        )
 
     def dis_cost(self,p):
         '''Helper function that gives the generation cost as a function of _dispatchable_ generation `p`'''
-        return (
-            p@np.diag(self.cost_coeffs[0,:])
-            + cp.square(p)@np.diag(self.cost_coeffs[1,:])
+        return cp.hstack([p, cp.square(p)])@cp.vstack([np.diag(self.cost_coeffs[0,:]), np.diag(self.cost_coeffs[1,:])])
+
+    def cost(self, p):
+        return cp.maximum(0, self.dis_cost(p-self.profile.int_gen))
+
+    def utility(self, p):
+        return cp.bmat(
+            [
+                [
+                    self.profile.nom_price.iloc[i,j]
+                    *self.profile.elasticity.iloc[i,j]
+                    /(self.profile.nom_load.iloc[i,j]+self.delta.iloc[i,j])**(1/self.profile.elasticity.iloc[i,j])
+                    /(self.profile.elasticity.iloc[i,j] + 1)
+                    *(
+                        (p[i,j]+self.delta.iloc[i,j])**(1+1/self.profile.elasticity.iloc[i,j])
+                        - self.delta.iloc[i,j]**(1+1/self.profile.elasticity.iloc[i,j])
+                    )
+                    for j in range(p.shape[1])
+                ]
+                for i in range(p.shape[0])
+            ]
         )
 
     def solve(self):
@@ -82,39 +122,12 @@ class Network:
             else constraints
         )
 
-        # The offset necessary to achieve the value-of-lost-load
-        delta = (
-            self.profile.nom_load*self.profile.voll**self.profile.elasticity
-            /(
-                self.profile.nom_price**self.profile.elasticity
-                - self.profile.voll**self.profile.elasticity
-            )
-        )
-
-        # The utility as a function of the load
-        utility = cp.bmat(
-            [
-                [
-                    self.profile.nom_price.iloc[i,j]
-                    *self.profile.elasticity.iloc[i,j]
-                    /(self.profile.nom_load.iloc[i,j]+delta.iloc[i,j])**(1/self.profile.elasticity.iloc[i,j])
-                    /(self.profile.elasticity.iloc[i,j] + 1)
-                    *(
-                        (load[i,j]+delta.iloc[i,j])**(1+1/self.profile.elasticity.iloc[i,j])
-                        - delta.iloc[i,j]**(1+1/self.profile.elasticity.iloc[i,j])
-                    )
-                    for j in range(load.shape[1])
-                ]
-                for i in range(load.shape[0])
-            ]
-        )
-
-        # The cost as a function of generation
-        cost = cp.maximum(0, self.dis_cost(generation-self.profile.int_gen))
+        opt_cost = self.cost(generation)
+        opt_utility = self.utility(load)
 
         opf = cp.Problem(
             cp.Minimize(
-                (cp.sum(cost)-cp.sum(utility))
+                (cp.sum(opt_cost)-cp.sum(opt_utility))
             ),
             constraints
         )
@@ -133,8 +146,8 @@ class Network:
                 'storage_load': pd.DataFrame(storage_load.value,columns=range(1,n+1)),
                 'angle': pd.DataFrame(angle.value,columns=range(1,n+1)),
                 'price': pd.DataFrame(price,columns=range(1,n+1)),
-                'cost': pd.DataFrame(cost.value,columns=generators),
-                'utility': pd.DataFrame(utility.value,columns=loads)
+                'cost': pd.DataFrame(opt_cost.value,columns=generators),
+                'utility': pd.DataFrame(opt_utility.value,columns=loads)
             },
             axis='columns'
         )
